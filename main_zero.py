@@ -255,6 +255,8 @@ def main():
         train_shards = cfg.data.train_shard_urls
         validation_shards = cfg.data.validation_shard_urls
 
+        assert len(train_shards) > 0, "Must provide string of train URLS"
+
     model, model_config = model_getter(
         cfg.model.size, config_path=args.model_cfg, return_cfg=True, dtype=model_dtype
     )
@@ -282,18 +284,22 @@ def main():
     del state
 
     if cfg.model.warm_start and not args.resume:
-        if jax.process_index() == 0:
-            logger.debug(
-                f"Warm starting model training from tiled checkpoint {cfg.model.model_path}"
-            )
+        if platform == "tpu":
+            if jax.process_index() == 0:
+                logger.debug(
+                    f"Warm starting model training from tiled checkpoint {cfg.model.model_path}"
+                )
 
-        del params
+            del params
 
-        bucket = client.bucket(cfg.data.bucket_path)
-        blob = bucket.blob(cfg.model.model_path)
-        param_bytes = msgpack_restore(blob.download_as_bytes())
+            bucket = client.bucket(cfg.data.bucket_path)
+            blob = bucket.blob(cfg.model.model_path)
+            param_bytes = msgpack_restore(blob.download_as_bytes())
 
-        params = flax.core.freeze(param_bytes)
+            params = flax.core.freeze(param_bytes)
+        else:
+            # TODO: download + load in model state
+            raise NotImplementedError
 
     if args.resume:
         del params
@@ -344,22 +350,23 @@ def main():
         )
 
     if not args.resume:
-        if cfg.data.bucket_path is not None:
-            # clear bucket
-            client = storage.Client()
-            if jax.process_index() == 0:
-                bucket = storage.Bucket(client, f"{cfg.data.bucket_path}")
-                blobs = bucket.list_blobs(
-                    prefix=f"{cfg.data.checkpoint_directory}/optimizer"
-                )
-                for blob in blobs:
-                    blob.delete()
+        if platform == "tpu":
+            if cfg.data.bucket_path is not None:
+                # clear bucket
+                client = storage.Client()
+                if jax.process_index() == 0:
+                    bucket = storage.Bucket(client, f"{cfg.data.bucket_path}")
+                    blobs = bucket.list_blobs(
+                        prefix=f"{cfg.data.checkpoint_directory}/optimizer"
+                    )
+                    for blob in blobs:
+                        blob.delete()
 
-                blobs = bucket.list_blobs(
-                    prefix=f"{cfg.data.checkpoint_directory}/params"
-                )
-                for blob in blobs:
-                    blob.delete()
+                    blobs = bucket.list_blobs(
+                        prefix=f"{cfg.data.checkpoint_directory}/params"
+                    )
+                    for blob in blobs:
+                        blob.delete()
 
     local_batch_size = cfg.training.batch_size // (
         jax.local_device_count() // cfg.device.mp_devices
@@ -583,8 +590,15 @@ def main():
                     )
 
                 else:
-                    raise NotImplementedError(
-                        "Checkpointing not currently implemented for GPU/CPU"
+                    save_checkpoint_params(
+                        params,
+                        absolute_step,
+                        workdir=f"checkpoints",
+                    )
+                    save_checkpoint_optimizer(
+                        opt_state,
+                        absolute_step,
+                        workdir=f"checkpoints",
                     )
 
         else:
